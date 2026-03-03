@@ -25,45 +25,74 @@ void main()
 # FRAGMENT SHADER (WORLD SPACE)
 # =========================
 fragmentShader = """
-uniform vec3 lightDir;    // direção normalizada DO fragmento PARA o sol (paralela, sol no infinito)
+#define MAX_SAMPLES 64
+
+uniform vec3 lightDir;     // direção normalizada DO fragmento PARA o sol
+uniform vec3 cameraPos;    // posição da câmera no world space
 
 uniform vec3 windowPos;
 uniform vec3 windowNormal;
 uniform vec3 windowRight;  // eixo local X da janela (world space)
 uniform vec3 windowUp;     // eixo local Y da janela (world space)
-uniform vec2 windowSize;   // tamanho total da janela (worldScale)
+uniform vec2 windowSize;   // meia-extensão da janela (world scale)
+
+uniform vec3  lightColor;      // cor da luz volumétrica (RGB)
+uniform float lightIntensity;  // intensidade geral
+uniform int   numSamples;      // passos de ray march (max MAX_SAMPLES)
+uniform float scattering;      // coeficiente de espalhamento
+uniform float falloffScale;    // velocidade de queda de intensidade com a distância
+uniform float marchStep;       // tamanho fixo do passo em world-units
 
 varying vec3 vWorldPos;
 
 bool passesThroughWindow(vec3 point)
 {
-    vec3 dir = lightDir;
-
-    float denom = dot(dir, windowNormal);
-    if(abs(denom) < 0.0001)
+    float denom = dot(lightDir, windowNormal);
+    if (abs(denom) < 0.0001)
         return false;
 
     float t = dot(windowPos - point, windowNormal) / denom;
-
-    if(t < 0.0)
+    if (t < 0.0)
         return false;
 
-    vec3 hit = point + dir * t;
+    vec3 hit   = point + lightDir * t;
     vec3 toHit = hit - windowPos;
 
-    // usa os eixos reais do objeto janela, sem recalcular
     float x = dot(toHit, windowRight);
     float y = dot(toHit, windowUp);
 
-    // windowSize = meia-extensão (worldScale de um plano padrão Blender com vértices em ±1)
-    return abs(x) < windowSize.x &&
-           abs(y) < windowSize.y;
+    return abs(x) < windowSize.x && abs(y) < windowSize.y;
 }
 
 void main()
 {
-    // DEBUG
-    gl_FragColor = vec4(vec3(passesThroughWindow(vWorldPos)), 1.0);
+    // Parte da superfície do fragmento em direção à câmera com passo fixo.
+    // Isso torna o efeito completamente independente da distância da câmera
+    // e garante que todos os samples estejam dentro do volume (cubo).
+    vec3  viewDir  = normalize(cameraPos - vWorldPos);
+    float stepSize = marchStep;   // world-units fixo
+    float accumLight = 0.0;
+
+    for (int i = 0; i < MAX_SAMPLES; i++)
+    {
+        if (i >= numSamples) break;
+
+        float t         = (float(i) + 0.5) * stepSize;
+        vec3  samplePos = vWorldPos + viewDir * t;
+
+        if (passesThroughWindow(samplePos))
+        {
+            // falloff quadrático pela distância ao plano da janela
+            float distFromWindow = max(0.0, dot(samplePos - windowPos, -lightDir));
+            float falloff        = 1.0 / (1.0 + falloffScale * distFromWindow * distFromWindow);
+            accumLight += scattering * stepSize * falloff;
+        }
+    }
+
+    accumLight = clamp(accumLight * lightIntensity, 0.0, 1.0);
+
+    vec3 color = lightColor * accumLight;
+    gl_FragColor = vec4(color, accumLight);
 }
 """
 
@@ -73,17 +102,32 @@ void main()
 # =========================
 class VolumetricLight(types.KX_PythonComponent):
 
-    args = OrderedDict([])
+    args = OrderedDict([
+        ("Light Color",      (1.0, 0.85, 0.6)),
+        ("Light Intensity",  2.5),
+        ("Num Samples",      32),
+        ("Scattering",       0.04),
+        ("Falloff Scale",    0.05),
+    ])
 
     def start(self, args):
 
-        self.scene = logic.getCurrentScene()
+        self.scene  = logic.getCurrentScene()
         self.shader = self.object.meshes[0].materials[0].getShader()
 
         if self.shader and not self.shader.isValid():
             self.shader.setSource(vertexShader, fragmentShader, 1)
 
         print("[VolumetricLight] Shader valid:", self.shader.isValid())
+
+        # parâmetros volumétricos
+        lc = args.get("Light Color",     (1.0, 0.85, 0.6))
+        self._light_color     = lc if isinstance(lc, (list, tuple)) else (1.0, 0.85, 0.6)
+        self._light_intensity = float(args.get("Light Intensity", 2.5))
+        self._num_samples     = int(args.get("Num Samples",        32))
+        self._march_step      = float(args.get("March Step",       0.05))
+        self._scattering      = float(args.get("Scattering",       0.04))
+        self._falloff_scale   = float(args.get("Falloff Scale",    0.05))
 
         self._debug_counter = 0
 
@@ -151,6 +195,24 @@ class VolumetricLight(types.KX_PythonComponent):
         self.shader.setUniform2f("windowSize",  size_x, size_y)
         self.shader.setUniform3f("windowPos", *window.worldPosition)
 
+        # câmera
+        cam_pos = self.scene.active_camera.worldPosition
+        self.shader.setUniform3f("cameraPos", cam_pos.x, cam_pos.y, cam_pos.z)
+
+        # uniforms volumétricos
+        lc = self._light_color
+        self.shader.setUniform3f("lightColor",     float(lc[0]), float(lc[1]), float(lc[2]))
+        self.shader.setUniform1f("lightIntensity",  self._light_intensity)
+        self.shader.setUniform1i("numSamples",      self._num_samples)
+        self.shader.setUniform1f("marchStep",       self._march_step)
+        self.shader.setUniform1f("scattering",      self._scattering)
+        self.shader.setUniform1f("falloffScale",    self._falloff_scale)
+
         if self._debug_counter % 60 == 1:
             print("[VolumetricLight] windowRight:", list(win_right), "windowUp:", list(win_up))
             print("[VolumetricLight] windowSize (half-extent):", size_x, size_y)
+            print("[VolumetricLight] cameraPos:", list(cam_pos))
+            print("[VolumetricLight] lightColor:", self._light_color,
+                  "intensity:", self._light_intensity,
+                  "samples:", self._num_samples,
+                  "marchStep:", self._march_step)
