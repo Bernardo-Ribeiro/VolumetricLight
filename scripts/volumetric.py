@@ -79,41 +79,76 @@ void main()
 {{
     vec3 rayDir = normalize(vWorldPos - cameraPos);
 
-    // Slab test: transforma o raio para espaço de objeto e intersecta o AABB.
-    // Como 'rayDir' é normalizado, o parâmetro t corresponde a distância
-    // world-units, portanto cameraPos + rayDir * t é válido diretamente.
-    vec3  rayOriginObj = (objectMatrixInv * vec4(cameraPos, 1.0)).xyz;
-    vec3  rayDirObj    = (objectMatrixInv * vec4(rayDir,    0.0)).xyz;
-    vec3  t0    = (boundsMin - rayOriginObj) / rayDirObj;
-    vec3  t1    = (boundsMax - rayOriginObj) / rayDirObj;
-    float tNear = max(max(min(t0.x,t1.x), min(t0.y,t1.y)), min(t0.z,t1.z));
-    float tFar  = min(min(max(t0.x,t1.x), max(t0.y,t1.y)), max(t0.z,t1.z));
+    // --- Ray em espaço de objeto ---
+    vec3 rayOriginObj = (objectMatrixInv * vec4(cameraPos, 1.0)).xyz;
+    vec3 rayDirObj    = (objectMatrixInv * vec4(rayDir, 0.0)).xyz;
 
-    if (tNear > tFar || tFar < 0.0) {{ gl_FragColor = vec4(0.0); return; }}
-    tNear = max(tNear, 0.0); // câmera dentro do volume: começar na câmera
+    // Evita divisão por zero
+    rayDirObj = sign(rayDirObj) * max(abs(rayDirObj), vec3(0.0001));
 
-    float jitter     = rand(gl_FragCoord.xy, time);
-    float accumLight = 0.0;
+    // --- Interseção AABB ---
+    vec3 t0 = (boundsMin - rayOriginObj) / rayDirObj;
+    vec3 t1 = (boundsMax - rayOriginObj) / rayDirObj;
+
+    vec3 tmin = min(t0, t1);
+    vec3 tmax = max(t0, t1);
+
+    float tNear = max(max(tmin.x, tmin.y), tmin.z);
+    float tFar  = min(min(tmax.x, tmax.y), tmax.z);
+
+    if (tNear > tFar || tFar < 0.0)
+    {{
+        gl_FragColor = vec4(0.0);
+        return;
+    }}
+
+    tNear = max(tNear, 0.0);
+
+    float jitter = rand(gl_FragCoord.xy, time);
+
+    float cosTheta = dot(rayDir, lightDir);
+
+    float isotropic = 0.25;
+    float forward = pow(max(cosTheta, 0.0), 6.0);
+    float phase = isotropic + forward * 0.6;
+
+    float radiance = 0.0;
+    float transmittance = 1.0;
+
+    float extinction = scattering * 0.5;
+
+    float stepSize = (tFar - tNear) / float(numSamples);
 
     for (int i = 0; i < MAX_SAMPLES; i++)
     {{
         if (i >= numSamples) break;
 
-        float t = tNear + (float(i) + 0.5 + jitter) * marchStep;
-        if (t >= tFar) break;
+        float t = tNear + (float(i) + jitter) * stepSize;
 
         vec3 samplePos = cameraPos + rayDir * t;
 
         if (passesThroughWindow(samplePos))
         {{
-            float dist    = max(0.0, dot(samplePos - windowPos, -lightDir));
-            float falloff = 1.0 / (1.0 + falloffScale * dist * dist);
-            accumLight   += scattering * marchStep * falloff;
+            float dist = max(0.0, dot(samplePos - windowPos, -lightDir));
+            float lightAtt = exp(-falloffScale * dist);
+
+            float scatteringTerm = scattering * lightAtt;
+
+            radiance += transmittance * scatteringTerm;
+
+            transmittance *= exp(-extinction * stepSize);
+
+            if (transmittance < 0.01)
+                break;
         }}
     }}
+    radiance *= stepSize;
 
-    accumLight = clamp(accumLight * lightIntensity, 0.0, 1.0);
-    gl_FragColor = vec4(lightColor * accumLight, accumLight);
+    float lightEnergy = (1.0 - exp(-radiance * lightIntensity)) * phase;
+
+    float alpha = clamp(1.0 - transmittance, 0.0, 0.8);
+
+    gl_FragColor = vec4(lightColor * lightEnergy, alpha);
 }}
 """
 
