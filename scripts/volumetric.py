@@ -2,10 +2,6 @@ from Range import *
 import mathutils
 from collections import OrderedDict
 
-# Limite de amostras — valor injetado no #define do GLSL via f-string.
-# Altere aqui para mudar nos dois lugares ao mesmo tempo.
-MAX_SHADER_SAMPLES = 64
-
 # =========================
 # VERTEX SHADER
 # =========================
@@ -22,134 +18,141 @@ void main()
 """
 
 # =========================
-# FRAGMENT SHADER
+# FRAGMENT SHADER  —  abordagem 100% analítica, sem loop
+#
+# Em vez de amostrar N pontos ao longo do raio (ray marching), descrevemos
+# analiticamente o conjunto de pontos do raio que estão dentro do prisma de luz.
+#
+# Para luz direcional + janela retangular, a condição de iluminação é:
+#   |offsetR + t*slopeR| < windowSize.x   (dentro da largura da janela)
+#   |offsetU + t*slopeU| < windowSize.y   (dentro da altura da janela)
+#   s(t) >= 0                             (do lado correto da janela)
+#
+# Cada condição é linear em t → dá um intervalo [t0, t1].
+# A interseção de todos os intervalos (+ AABB slab test) dá o segmento iluminado exato.
+#
+# O falloff exponencial é integrado analiticamente:
+#   ∫ exp(-k * dist(t)) dt  com dist(t) = d0 + dr*t  (linear em t)
+#   = -1/(k*dr) * [exp(-k*(d0+dr*tB)) - exp(-k*(d0+dr*tA))]
 # =========================
-fragmentShader = f"""
-#define MAX_SAMPLES {MAX_SHADER_SAMPLES}
-
+fragmentShader = """
 // --- Janela (portal de luz) ---
-uniform vec3  windowPos;    // centro da janela no world space
-uniform vec3  windowNormal; // normal do plano da janela (aponta para o sol)
-uniform vec3  windowRight;  // eixo local X da janela
-uniform vec3  windowUp;     // eixo local Y da janela
-uniform vec2  windowSize;   // meia-extensão (half-extent) da janela
+uniform vec3  windowPos;
+uniform vec3  windowNormal;
+uniform vec3  windowRight;
+uniform vec3  windowUp;
+uniform vec2  windowSize;
 
 // --- Volume ---
-uniform mat4  objectMatrixInv; // inversa da world transform do volume
-uniform vec3  boundsMin;       // AABB mínimo em espaço de objeto
-uniform vec3  boundsMax;       // AABB máximo em espaço de objeto
+uniform mat4  objectMatrixInv;
+uniform vec3  boundsMin;
+uniform vec3  boundsMax;
 
 // --- Câmera e luz ---
-uniform vec3  cameraPos;       // posição da câmera no world space
-uniform vec3  lightDir;        // direção normalizada DO ponto PARA o sol
-uniform vec3  lightColor;      // cor da luz volumétrica (RGB)
-uniform float lightIntensity;  // multiplicador de intensidade final
+uniform vec3  cameraPos;
+uniform vec3  lightDir;
+uniform vec3  lightColor;
+uniform float lightIntensity;
 
-// --- Ray march ---
-uniform int   numSamples;   // número de passos (max MAX_SAMPLES)
-uniform float marchStep;    // tamanho do passo em world-units
-uniform float scattering;   // coeficiente de espalhamento por passo
-uniform float falloffScale; // velocidade de queda quadrática com distância à janela
-uniform float time;         // tempo em segundos (seed do jitter)
+// --- Parâmetros volumétricos ---
+uniform float scattering;   // densidade do meio
+uniform float falloffScale; // coeficiente de attenuação exponencial com distância à janela
 
 varying vec3 vWorldPos;
 
-// Retorna true se o raio partindo de 'point' na direção 'lightDir'
-// intersecta o rectângulo da janela.
-bool passesThroughWindow(vec3 point)
-{{
-    float denom = dot(lightDir, windowNormal);
-    if (abs(denom) < 0.0001) return false;
-
-    float t = dot(windowPos - point, windowNormal) / denom;
-    if (t < 0.0) return false;
-
-    vec3 toHit = (point + lightDir * t) - windowPos;
-    return abs(dot(toHit, windowRight)) < windowSize.x &&
-           abs(dot(toHit, windowUp))    < windowSize.y;
-}}
-
-// Hash pseudo-aleatório por pixel: quebra o banding sem custo extra de amostras.
-float rand(vec2 co, float t)
-{{
-    return fract(sin(dot(co + t, vec2(127.1, 311.7))) * 43758.5453);
-}}
-
 void main()
-{{
+{
     vec3 rayDir = normalize(vWorldPos - cameraPos);
 
-    // --- Ray em espaço de objeto ---
-    vec3 rayOriginObj = (objectMatrixInv * vec4(cameraPos, 1.0)).xyz;
-    vec3 rayDirObj    = (objectMatrixInv * vec4(rayDir, 0.0)).xyz;
-
-    // Evita divisão por zero
-    rayDirObj = sign(rayDirObj) * max(abs(rayDirObj), vec3(0.0001));
-
-    // --- Interseção AABB ---
-    vec3 t0 = (boundsMin - rayOriginObj) / rayDirObj;
-    vec3 t1 = (boundsMax - rayOriginObj) / rayDirObj;
-
-    vec3 tmin = min(t0, t1);
-    vec3 tmax = max(t0, t1);
-
-    float tNear = max(max(tmin.x, tmin.y), tmin.z);
-    float tFar  = min(min(tmax.x, tmax.y), tmax.z);
-
-    if (tNear > tFar || tFar < 0.0)
-    {{
-        gl_FragColor = vec4(0.0);
-        return;
-    }}
-
+    // --- Slab test AABB em espaço de objeto ---
+    // Como rayDir é normalizado, t é distância real em world-units desde a câmera.
+    vec3 ro = (objectMatrixInv * vec4(cameraPos, 1.0)).xyz;
+    vec3 rd = (objectMatrixInv * vec4(rayDir,    0.0)).xyz;
+    // Evita divisão por zero nos eixos paralelos
+    rd = mix(rd, sign(rd) * vec3(1e-5), lessThan(abs(rd), vec3(1e-5)));
+    vec3  t0    = (boundsMin - ro) / rd;
+    vec3  t1    = (boundsMax - ro) / rd;
+    float tNear = max(max(min(t0.x,t1.x), min(t0.y,t1.y)), min(t0.z,t1.z));
+    float tFar  = min(min(max(t0.x,t1.x), max(t0.y,t1.y)), max(t0.z,t1.z));
+    if (tNear > tFar || tFar < 0.0) { gl_FragColor = vec4(0.0); return; }
     tNear = max(tNear, 0.0);
 
-    float jitter = rand(gl_FragCoord.xy, time);
+    // --- Interseção analítica com o prisma de luz ---
+    // Para luz direcional, o prisma é o conjunto de pontos P tal que o raio
+    // P + s*lightDir intersecta a janela com s >= 0.
+    // A projeção P(t) = cameraPos + t*rayDir sobre os eixos da janela é linear em t,
+    // portanto cada condição de bound é um intervalo fechado em t.
+    float denom = dot(lightDir, windowNormal);
+    if (abs(denom) < 1e-4) { gl_FragColor = vec4(0.0); return; }
 
-    float cosTheta = dot(rayDir, lightDir);
+    float A = dot(windowPos - cameraPos, windowNormal); // dist cacm->janela
+    float B = dot(rayDir, windowNormal);
 
-    float isotropic = 0.25;
-    float forward = pow(max(cosTheta, 0.0), 6.0);
-    float phase = isotropic + forward * 0.6;
+    // Projeção no eixo Right: f(t) = offsetR + t*slopeR
+    float lR      = dot(lightDir, windowRight) / denom;
+    float offsetR = dot(cameraPos - windowPos, windowRight) + A * lR;
+    float slopeR  = dot(rayDir, windowRight) - B * lR;
+    float tR0, tR1;
+    if (abs(slopeR) > 1e-6) {
+        tR0 = (-windowSize.x - offsetR) / slopeR;
+        tR1 = ( windowSize.x - offsetR) / slopeR;
+        if (tR0 > tR1) { float tmp = tR0; tR0 = tR1; tR1 = tmp; }
+    } else if (abs(offsetR) >= windowSize.x) {
+        gl_FragColor = vec4(0.0); return;
+    } else { tR0 = -1e9; tR1 = 1e9; }
 
-    float radiance = 0.0;
-    float transmittance = 1.0;
+    // Projeção no eixo Up: g(t) = offsetU + t*slopeU
+    float lU      = dot(lightDir, windowUp) / denom;
+    float offsetU = dot(cameraPos - windowPos, windowUp) + A * lU;
+    float slopeU  = dot(rayDir, windowUp) - B * lU;
+    float tU0, tU1;
+    if (abs(slopeU) > 1e-6) {
+        tU0 = (-windowSize.y - offsetU) / slopeU;
+        tU1 = ( windowSize.y - offsetU) / slopeU;
+        if (tU0 > tU1) { float tmp = tU0; tU0 = tU1; tU1 = tmp; }
+    } else if (abs(offsetU) >= windowSize.y) {
+        gl_FragColor = vec4(0.0); return;
+    } else { tU0 = -1e9; tU1 = 1e9; }
 
-    float extinction = scattering * 0.5;
+    // Condição s(t) >= 0: amostra do lado certo da janela (luz viaja para frente)
+    float tS0, tS1;
+    if (abs(B) > 1e-6) {
+        float tS = A / B;
+        if (denom * B > 0.0) { tS0 = -1e9; tS1 = tS; }
+        else                 { tS0 = tS;   tS1 = 1e9; }
+    } else if ((denom > 0.0 && A < 0.0) || (denom < 0.0 && A > 0.0)) {
+        gl_FragColor = vec4(0.0); return;
+    } else { tS0 = -1e9; tS1 = 1e9; }
 
-    float stepSize = (tFar - tNear) / float(numSamples);
+    // Segmento final iluminado: interseção de todos os intervalos
+    float tA = max(max(max(tNear, tR0), tU0), tS0);
+    float tB = min(min(min(tFar,  tR1), tU1), tS1);
+    if (tA >= tB) { gl_FragColor = vec4(0.0); return; }
 
-    for (int i = 0; i < MAX_SAMPLES; i++)
-    {{
-        if (i >= numSamples) break;
+    // --- Integração analítica do falloff exponencial sobre [tA, tB] ---
+    // falloff(t) = exp(-falloffScale * dist(t))
+    // dist(t) = max(0, d0 + dr*t)  com d0 e dr constantes
+    // ∫ exp(-k*(d0+dr*t)) dt = -1/(k*dr) * exp(-k*(d0+dr*t))
+    float d0 = dot(windowPos - cameraPos, lightDir);
+    float dr = -dot(rayDir, lightDir);
+    float k  = falloffScale;
 
-        float t = tNear + (float(i) + jitter) * stepSize;
+    float accumLight;
+    if (abs(dr) < 1e-6 || k < 1e-9) {
+        // falloff constante ao longo do raio
+        float dist    = max(0.0, d0 + dr * (tA + tB) * 0.5);
+        float falloff = exp(-k * dist);
+        accumLight = scattering * falloff * (tB - tA);
+    } else {
+        // Integral exata: [-1/(k*dr)] * [exp(-k*(d0+dr*tB)) - exp(-k*(d0+dr*tA))]
+        float eA = exp(-k * max(0.0, d0 + dr * tA));
+        float eB = exp(-k * max(0.0, d0 + dr * tB));
+        accumLight = scattering * abs((eA - eB) / (k * dr));
+    }
 
-        vec3 samplePos = cameraPos + rayDir * t;
-
-        if (passesThroughWindow(samplePos))
-        {{
-            float dist = max(0.0, dot(samplePos - windowPos, -lightDir));
-            float lightAtt = exp(-falloffScale * dist);
-
-            float scatteringTerm = scattering * lightAtt;
-
-            radiance += transmittance * scatteringTerm;
-
-            transmittance *= exp(-extinction * stepSize);
-
-            if (transmittance < 0.01)
-                break;
-        }}
-    }}
-    radiance *= stepSize;
-
-    float lightEnergy = (1.0 - exp(-radiance * lightIntensity)) * phase;
-
-    float alpha = clamp(1.0 - transmittance, 0.0, 0.8);
-
-    gl_FragColor = vec4(lightColor * lightEnergy, alpha);
-}}
+    float lit = clamp(accumLight * lightIntensity, 0.0, 0.75);
+    gl_FragColor = vec4(lightColor * lit, lit);
+}
 """
 
 
@@ -161,8 +164,6 @@ class VolumetricLight(types.KX_PythonComponent):
     args = OrderedDict([
         ("Light Color",     (1.0, 0.88, 0.7)),
         ("Light Intensity", 1.0),
-        ("Num Samples",     32),
-        ("March Step",      0.0),  # 0.0 = derivar automaticamente da diagonal do volume
         ("Scattering",      0.5),
         ("Falloff Scale",   0.05),
     ])
@@ -181,13 +182,6 @@ class VolumetricLight(types.KX_PythonComponent):
         self._light_intensity = float(args.get("Light Intensity", 1.0))
         self._scattering      = float(args.get("Scattering",      0.5))
         self._falloff_scale   = float(args.get("Falloff Scale",   0.05))
-        self._march_step      = float(args.get("March Step",      0.0))
-
-        self._num_samples = int(args.get("Num Samples", 32))
-        if self._num_samples > MAX_SHADER_SAMPLES:
-            print(f"[VolumetricLight] AVISO: Num Samples ({self._num_samples}) "
-                  f"excede MAX_SHADER_SAMPLES ({MAX_SHADER_SAMPLES}). Valor reduzido.")
-            self._num_samples = MAX_SHADER_SAMPLES
 
         # Calcular AABB da mesh em espaço de objeto (válido para qualquer forma)
         mesh = self.object.meshes[0]
@@ -275,15 +269,5 @@ class VolumetricLight(types.KX_PythonComponent):
         lc = self._light_color
         self.shader.setUniform3f("lightColor",    float(lc[0]), float(lc[1]), float(lc[2]))
         self.shader.setUniform1f("lightIntensity", self._light_intensity)
-        self.shader.setUniform1i("numSamples",     self._num_samples)
         self.shader.setUniform1f("scattering",     self._scattering)
         self.shader.setUniform1f("falloffScale",   self._falloff_scale)
-        self.shader.setUniform1f("time",           logic.getRealTime())
-
-        # marchStep: manual se > 0, senão deriva da diagonal do AABB
-        if self._march_step > 0.0:
-            march_step = self._march_step
-        else:
-            diagonal   = (mathutils.Vector(self._bounds_max) - mathutils.Vector(self._bounds_min)).length
-            march_step = (diagonal * max(self.object.worldScale)) / max(self._num_samples, 1)
-        self.shader.setUniform1f("marchStep", march_step)
