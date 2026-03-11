@@ -1,11 +1,17 @@
 from Range import *
 from collections import OrderedDict
+import bgl
+from mathutils import Matrix
 
 
 occlusionShader = """
 uniform sampler2D bgl_DepthTexture;
 
 uniform mat4 boxMatrix[boxMax];
+uniform sampler2D shadowMap;
+uniform mat4 shadowMatrix;
+uniform float shadowBias;
+uniform int shadowEnabled;
 
 uniform vec3 windowPos;
 uniform vec3 windowNormal;
@@ -53,6 +59,27 @@ vec2 boxVolume(vec3 ori, vec3 dir, mat4 matrix) {
     return box;
 }
 
+float sampleShadow(vec3 worldPos)
+{
+    if (shadowEnabled == 0) {
+        return 1.0;
+    }
+
+    vec4 coord = shadowMatrix * vec4(worldPos, 1.0);
+    coord.xyz /= coord.w;
+
+    if(coord.x < 0.0 || coord.x > 1.0 ||
+       coord.y < 0.0 || coord.y > 1.0)
+        return 1.0;
+
+    float shadowDepth = texture(shadowMap, coord.xy).r;
+
+    if(coord.z - shadowBias > shadowDepth)
+        return 0.0;
+
+    return 1.0;
+}
+
 void main() {
     vec2 uv = gl_TexCoord[0].st;
 
@@ -74,11 +101,14 @@ void main() {
         return;
     }
 
+    vec3 newPos = windowPos + lightDir * 1.5;
+
     float A = dot(windowPos - cameraPos, windowNormal);
     float B = dot(rayDir, windowNormal);
+    float C = dot(newPos - cameraPos, windowNormal);
 
     float lR = dot(lightDir, windowRight) / denom;
-    float offsetR = dot(cameraPos - windowPos, windowRight) + A * lR;
+    float offsetR = dot(cameraPos - newPos, windowRight) + C * lR;
     float slopeR = dot(rayDir, windowRight) - B * lR;
     float tR0, tR1;
     if (abs(slopeR) > 1e-6) {
@@ -94,7 +124,7 @@ void main() {
     }
 
     float lU = dot(lightDir, windowUp) / denom;
-    float offsetU = dot(cameraPos - windowPos, windowUp) + A * lU;
+    float offsetU = dot(cameraPos - newPos, windowUp) + C * lU;
     float slopeU = dot(rayDir, windowUp) - B * lU;
     float tU0, tU1;
     if (abs(slopeU) > 1e-6) {
@@ -122,7 +152,7 @@ void main() {
         tS1 = 1e9;
     }
 
-    float d0 = dot(windowPos - cameraPos, lightDir);
+    float d0 = dot(newPos - cameraPos, lightDir);
     float dr = -dot(rayDir, lightDir);
     float k = falloffScale;
 
@@ -144,7 +174,12 @@ void main() {
             continue;
         }
 
+        vec3 P = cameraPos + rayDir * ((tA + tB) * 0.5);
+
+        float shadowFactor = sampleShadow(P);
+
         float boxLight;
+        
         if (abs(dr) < 1e-6 || k < 1e-9) {
             float dist = max(0.0, d0 + dr * (tA + tB) * 0.5);
             float falloff = exp(-k * dist);
@@ -155,7 +190,9 @@ void main() {
             boxLight = scattering * abs((eA - eB) / (k * dr));
         }
 
-        accumLight = max(accumLight, boxLight);
+        boxLight *= shadowFactor;
+
+        accumLight += boxLight;
     }
 
     float lit = clamp(accumLight * lightIntensity, 0.0, 1.0);
@@ -185,12 +222,13 @@ void main() {
 class VolumetricFilter(types.KX_PythonComponent):
 
     args = OrderedDict([
+        ("layer", 2),
         ("Sun Object", "Sun"),
         ("Window Object", "WindowPortal"),
         ("Light Color", (1.0, 0.88, 0.7)),
         ("Light Intensity", 1.0),
-        ("Scattering", 0.5),
-        ("Falloff Scale", 0.05),
+        ("Scattering", 0.3),
+        ("Falloff Scale", 0.5),
         ("Blend Strength", 0.8),
         ("Resolution Scale", 0.5),
     ])
@@ -199,7 +237,10 @@ class VolumetricFilter(types.KX_PythonComponent):
         self.scene = logic.getCurrentScene()
         self.cam = self.scene.active_camera
 
+        self.layer = int(args["layer"])
+
         self._sun_name = str(args.get("Sun Object", "Sun"))
+
         self._window_name = str(args.get("Window Object", "WindowPortal"))
 
         lc = args.get("Light Color", (1.0, 0.88, 0.7))
@@ -209,15 +250,24 @@ class VolumetricFilter(types.KX_PythonComponent):
         self._falloff_scale = float(args.get("Falloff Scale", 0.05))
         self._blend_strength = float(args.get("Blend Strength", 0.8))
         self._resolution_scale = max(0.1, min(1.0, float(args.get("Resolution Scale", 0.5))))
+
         self.boxList = [obj for obj in self.object.scene.objects if "box" in obj.name.lower()]
+
+        if len(self.boxList) == 0:
+            print("[VolumetricLight] AVISO: nenhum objeto 'box' encontrado na cena.")
+            print("[VolumetricLight] O shader rodara sem oclusão volumetrica.")
 
         getFilter = self.scene.filterManager.addFilter
         custom = logic.RAS_2DFILTER_CUSTOMFILTER
 
         box_count = max(1, len(self.boxList))
         const = f"const int boxMax = {box_count};"
-        self._occlusion_filter = getFilter(0, custom, const + occlusionShader)
-        self._final_filter = getFilter(1, custom, finalShader)
+
+        # PASS 1 — OCCLUSION
+        self._occlusion_filter = getFilter(self.layer, custom, const + occlusionShader)
+
+        # PASS 2 — FINAL
+        self._final_filter = getFilter(self.layer + 1, custom, finalShader)
 
         width = int(render.getWindowWidth() * self._resolution_scale)
         height = int(render.getWindowHeight() * self._resolution_scale)
@@ -233,16 +283,16 @@ class VolumetricFilter(types.KX_PythonComponent):
         self._final_filter.setTexture(0, bind_code, "bgl_RenderedOcclusion")
 
         self._debug_counter = 0
-        print(f"[VolumetricLight] boxes detectadas: {len(self.boxList)}")
+        self._warned_shadow_unavailable = False
         print("[VolumetricLight] Screen filter pronto.")
 
     def update(self):
         sun = self.scene.objects.get(self._sun_name)
         window = self.scene.objects.get(self._window_name)
 
-        self._debug_counter += 1
-        if self._debug_counter % 60 == 1:
-            self._log_debug(sun, window)
+        #self._debug_counter += 1
+        #if self._debug_counter % 60 == 1:
+        #    self._log_debug(sun, window)
 
         if not sun or not window:
             return
@@ -265,9 +315,18 @@ class VolumetricFilter(types.KX_PythonComponent):
 
         for i, box in enumerate(self.boxList):
             shader.setUniformMatrix4(f"boxMatrix[{i}]", box.worldTransform)
-
-        sun_dir = sun.worldOrientation.col[2]
+        sun_dir = sun.worldOrientation.col[2].normalized()
         shader.setUniform3f("lightDir", sun_dir.x, sun_dir.y, sun_dir.z)
+
+        shader.setUniformMatrix4("shadowMatrix", self._shadow_matrix(sun))
+        shader.setUniform1f("shadowBias", 0.001)
+
+        shadow_bind_id = self._shadow_bind_id(sun)
+        bgl.glActiveTexture(bgl.GL_TEXTURE3)
+        bgl.glBindTexture(bgl.GL_TEXTURE_2D, shadow_bind_id)
+
+        shader.setUniform1i("shadowMap", 3)
+        shader.setUniform1i("shadowEnabled", 1 if shadow_bind_id > 0 else 0)
 
         orient = window.worldOrientation
         best_axis = max([0, 1, 2], key=lambda i: abs(orient.col[i].dot(sun_dir)))
@@ -289,6 +348,45 @@ class VolumetricFilter(types.KX_PythonComponent):
         shader.setUniform1f("lightIntensity", self._light_intensity)
         shader.setUniform1f("scattering", self._scattering)
         shader.setUniform1f("falloffScale", self._falloff_scale)
+
+    def _shadow_matrix(self, light):
+        # Keep compatibility with lights that do not expose full shadow settings.
+        try:
+            size = float(light.shadowFrustumSize)
+            near = float(light.shadowClipStart)
+            far = float(light.shadowClipEnd)
+
+            bias = Matrix()
+            bias[0][0] = 0.5
+            bias[0][3] = 0.5
+            bias[1][1] = 0.5
+            bias[1][3] = 0.5
+            bias[2][2] = 0.5
+            bias[2][3] = 0.5
+
+            proj = Matrix.OrthoProjection('XY', 4)
+            proj[0][0] = 1.0 / size
+            proj[1][1] = 1.0 / size
+            proj[2][2] = -2.0 / (far - near)
+            proj[2][3] = -((far + near) / (far - near))
+
+            view = light.worldOrientation.to_4x4()
+            view[0][3] = light.worldPosition[0]
+            view[1][3] = light.worldPosition[1]
+            view[2][3] = light.worldPosition[2]
+            world_to_lamp = view.inverted()
+
+            # Shadow lookup must stay in world->light space and not depend on camera transforms.
+            return bias * proj * world_to_lamp
+        except Exception:
+            return getattr(light, "shadowMatrix", Matrix.Identity(4))
+
+    def _shadow_bind_id(self, light):
+        bind_id = int(getattr(light, "shadowBindId", 0) or 0)
+        if bind_id <= 0 and not self._warned_shadow_unavailable:
+            print("[VolumetricLight] AVISO: shadow map indisponivel no Sun (ative shadows no light).")
+            self._warned_shadow_unavailable = True
+        return bind_id
 
     def _update_final_uniforms(self):
         shader = self._final_filter
