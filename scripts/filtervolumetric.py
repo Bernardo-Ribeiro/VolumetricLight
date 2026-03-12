@@ -20,9 +20,10 @@ uniform vec3 windowUp;
 uniform vec2 windowSize;
 
 uniform vec3 lightDir;
-uniform float lightIntensity;
-uniform float scattering;
-uniform float falloffScale;
+
+const float LIGHT_INTENSITY = 1.0;
+const float SCATTERING = 0.4;
+const float FALLOFF_SCALE = 0.5;
 
 vec3 getViewPos(vec2 coord) {
     float depth = texture(bgl_DepthTexture, coord).x;
@@ -61,9 +62,8 @@ vec2 boxVolume(vec3 ori, vec3 dir, mat4 matrix) {
 
 float sampleShadow(vec3 worldPos)
 {
-    if (shadowEnabled == 0) {
+    if (shadowEnabled == 0)
         return 1.0;
-    }
 
     vec4 coord = shadowMatrix * vec4(worldPos, 1.0);
     coord.xyz /= coord.w;
@@ -72,12 +72,21 @@ float sampleShadow(vec3 worldPos)
        coord.y < 0.0 || coord.y > 1.0)
         return 1.0;
 
-    float shadowDepth = texture(shadowMap, coord.xy).r;
+    float texel = 1.0 / 2048.0; // ajuste para resolução do shadow map
 
-    if(coord.z - shadowBias > shadowDepth)
-        return 0.0;
+    float shadow = 0.0;
 
-    return 1.0;
+    for(int x = -1; x <= 1; x++)
+    for(int y = -1; y <= 1; y++)
+    {
+        vec2 off = vec2(x,y) * texel;
+        float d = texture(shadowMap, coord.xy + off).r;
+
+        if(coord.z - shadowBias <= d)
+            shadow += 1.0;
+    }
+
+    return shadow / 9.0;
 }
 
 void main() {
@@ -154,28 +163,33 @@ void main() {
 
     float d0 = dot(newPos - cameraPos, lightDir);
     float dr = -dot(rayDir, lightDir);
-    float k = falloffScale;
+    float k = FALLOFF_SCALE;
 
     float accumLight = 0.0;
     for (int i = 0; i < boxMax; i++) {
-        vec3 pos = cameraPos - boxMatrix[i][3].xyz;
-        vec2 boxDist = boxVolume(pos, rayDir, boxMatrix[i]);
+        mat4 invBox = inverse(boxMatrix[i]);
+
+        vec3 roLocal = (invBox * vec4(cameraPos,1.0)).xyz;
+        vec3 rdLocal = (invBox * vec4(rayDir,0.0)).xyz;
+
+        vec2 boxDist = intersectCube(roLocal, rdLocal, vec3(1.0));
 
         if (boxDist.x >= maxDist) {
             continue;
         }
 
         float tNear = boxDist.x;
-        float tFar = min(boxDist.y, maxDist);
+        float tFar  = boxDist.y;
         float tA = max(max(max(tNear, tR0), tU0), tS0);
         float tB = min(min(min(tFar, tR1), tU1), tS1);
+        tB = min(tB, maxDist);
 
         if (tA >= tB) {
             continue;
         }
 
         vec3 P = cameraPos + rayDir * ((tA + tB) * 0.5);
-
+        P += lightDir * shadowBias * 10.0;
         float shadowFactor = sampleShadow(P);
 
         float boxLight;
@@ -183,11 +197,14 @@ void main() {
         if (abs(dr) < 1e-6 || k < 1e-9) {
             float dist = max(0.0, d0 + dr * (tA + tB) * 0.5);
             float falloff = exp(-k * dist);
-            boxLight = scattering * falloff * (tB - tA);
+            boxLight = SCATTERING * falloff * (tB - tA);
         } else {
-            float eA = exp(-k * max(0.0, d0 + dr * tA));
-            float eB = exp(-k * max(0.0, d0 + dr * tB));
-            boxLight = scattering * abs((eA - eB) / (k * dr));
+            float a = max(0.0, d0 + dr * tA);
+            float b = max(0.0, d0 + dr * tB);
+
+            float eA = exp(-k * a);
+            float eB = exp(-k * b);
+            boxLight = SCATTERING * abs((eA - eB) / (k * dr));
         }
 
         boxLight *= shadowFactor;
@@ -195,7 +212,7 @@ void main() {
         accumLight += boxLight;
     }
 
-    float lit = clamp(accumLight * lightIntensity, 0.0, 1.0);
+    float lit = clamp(accumLight * LIGHT_INTENSITY, 0.0, 1.0);
     gl_FragColor = vec4(lit, lit, lit, lit);
 }
 """
@@ -205,15 +222,15 @@ finalShader = """
 uniform sampler2D bgl_RenderedTexture;
 uniform sampler2D bgl_RenderedOcclusion;
 
-uniform vec3 lightColor;
-uniform float blendStrength;
+const vec3 LIGHT_COLOR = vec3(1.0, 0.88, 0.7);
+const float BLEND_STRENGTH = 0.8;
 
 void main() {
     vec2 uv = gl_TexCoord[0].st;
     vec3 image = texture(bgl_RenderedTexture, uv).rgb;
     float occlusion = texture(bgl_RenderedOcclusion, uv).r;
 
-    vec3 volumetric = image + lightColor * (occlusion * blendStrength);
+    vec3 volumetric = image + LIGHT_COLOR * (occlusion * BLEND_STRENGTH);
     gl_FragColor = vec4(volumetric, 1.0);
 }
 """
@@ -225,11 +242,6 @@ class VolumetricFilter(types.KX_PythonComponent):
         ("layer", 2),
         ("Sun Object", "Sun"),
         ("Window Object", "WindowPortal"),
-        ("Light Color", (1.0, 0.88, 0.7)),
-        ("Light Intensity", 1.0),
-        ("Scattering", 0.3),
-        ("Falloff Scale", 0.5),
-        ("Blend Strength", 0.8),
         ("Resolution Scale", 0.5),
     ])
 
@@ -242,13 +254,6 @@ class VolumetricFilter(types.KX_PythonComponent):
         self._sun_name = str(args.get("Sun Object", "Sun"))
 
         self._window_name = str(args.get("Window Object", "WindowPortal"))
-
-        lc = args.get("Light Color", (1.0, 0.88, 0.7))
-        self._light_color = lc if isinstance(lc, (list, tuple)) else (1.0, 0.88, 0.7)
-        self._light_intensity = float(args.get("Light Intensity", 1.0))
-        self._scattering = float(args.get("Scattering", 0.5))
-        self._falloff_scale = float(args.get("Falloff Scale", 0.05))
-        self._blend_strength = float(args.get("Blend Strength", 0.8))
         self._resolution_scale = max(0.1, min(1.0, float(args.get("Resolution Scale", 0.5))))
 
         self.boxList = [obj for obj in self.object.scene.objects if "box" in obj.name.lower()]
@@ -298,7 +303,6 @@ class VolumetricFilter(types.KX_PythonComponent):
             return
 
         self._update_occlusion_uniforms(sun, window)
-        self._update_final_uniforms()
 
     def _log_debug(self, sun, window):
         if not sun:
@@ -319,7 +323,7 @@ class VolumetricFilter(types.KX_PythonComponent):
         shader.setUniform3f("lightDir", sun_dir.x, sun_dir.y, sun_dir.z)
 
         shader.setUniformMatrix4("shadowMatrix", self._shadow_matrix(sun))
-        shader.setUniform1f("shadowBias", 0.001)
+        shader.setUniform1f("shadowBias", 0.0001)
 
         shadow_bind_id = self._shadow_bind_id(sun)
         bgl.glActiveTexture(bgl.GL_TEXTURE3)
@@ -344,10 +348,6 @@ class VolumetricFilter(types.KX_PythonComponent):
         shader.setUniform3f("windowUp", win_up.x, win_up.y, win_up.z)
         shader.setUniform2f("windowSize", scale[other[0]], scale[other[1]])
         shader.setUniform3f("windowPos", *window.worldPosition)
-
-        shader.setUniform1f("lightIntensity", self._light_intensity)
-        shader.setUniform1f("scattering", self._scattering)
-        shader.setUniform1f("falloffScale", self._falloff_scale)
 
     def _shadow_matrix(self, light):
         # Keep compatibility with lights that do not expose full shadow settings.
@@ -388,8 +388,3 @@ class VolumetricFilter(types.KX_PythonComponent):
             self._warned_shadow_unavailable = True
         return bind_id
 
-    def _update_final_uniforms(self):
-        shader = self._final_filter
-        lc = self._light_color
-        shader.setUniform3f("lightColor", float(lc[0]), float(lc[1]), float(lc[2]))
-        shader.setUniform1f("blendStrength", self._blend_strength)
